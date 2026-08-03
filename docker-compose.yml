@@ -106,65 +106,27 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+    # Pass every variable in infra/.env straight through. This matters: a var that
+    # is commented out (e.g. DATABASE_URL) must stay ABSENT from the container's
+    # environment so Spring's own `${VAR:default}` placeholder can compute its
+    # fallback. Listing a key directly under `environment:` with a shell
+    # `${VAR:-}` substitution — even to represent "unset" — instead sets it to an
+    # EMPTY STRING in the container, and Spring treats "present but empty"
+    # differently from "absent": it uses the empty value, not the default. That
+    # bug is what broke the datasource URL here before; env_file avoids the whole
+    # class of it by only ever setting what infra/.env actually defines.
+    env_file:
+      - .env
     environment:
-      # Database — inside the compose network the app talks to the `postgres`
-      # service by name, on Postgres's own default port (not the host-mapped one).
+      # Overrides for values that must point at in-network service names/ports
+      # rather than the host-mapped ones (or an internal container path). Keep
+      # this list to ONLY genuinely network/topology-specific values — everything
+      # else passes through from .env unchanged via env_file above.
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      DATABASE_URL: ${DATABASE_URL:-}
-      DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-10}
-
-      # API
-      API_BASE_PATH: ${API_BASE_PATH:-/api/v1}
-
-      # CSV upload / audit storage
-      CSV_UPLOAD_MAX_FILE_SIZE: ${CSV_UPLOAD_MAX_FILE_SIZE:-2MB}
-      AMORTIZATION_SCHEDULE_STORAGE_DIR: /app/storage/credit-cases
-
-      # Auth / sessions
-      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
-      SESSION_TIMEOUT: ${SESSION_TIMEOUT:-PT8H}
-      AUTH_LOGIN_MAX_ATTEMPTS: ${AUTH_LOGIN_MAX_ATTEMPTS:-5}
-      AUTH_LOGIN_RATE_WINDOW: ${AUTH_LOGIN_RATE_WINDOW:-PT15M}
-
-      # Observability
-      ACTUATOR_EXPOSED_ENDPOINTS: ${ACTUATOR_EXPOSED_ENDPOINTS:-health,info}
-      LOG_FILE: /app/logs/nimba.log
-
-      # Account provisioning / invitation links — MUST be the public URL a human
-      # clicks from their inbox, i.e. where `web` is actually reachable, not the
-      # internal service name.
-      APP_FRONTEND_BASE_URL: ${APP_FRONTEND_BASE_URL:-http://localhost:3000}
-      INVITATION_TTL: ${INVITATION_TTL:-P7D}
-
-      # Mail
-      MAIL_ENABLED: ${MAIL_ENABLED:-true}
-      MAIL_TRANSPORT: ${MAIL_TRANSPORT:-smtp}
-      MAIL_HOST: ${MAIL_HOST:-mailpit}
-      MAIL_PORT: ${MAIL_PORT:-1025}
-      MAIL_USERNAME: ${MAIL_USERNAME:-}
-      MAIL_PASSWORD: ${MAIL_PASSWORD:-}
-      MAIL_SMTP_AUTH: ${MAIL_SMTP_AUTH:-false}
-      MAIL_SMTP_STARTTLS: ${MAIL_SMTP_STARTTLS:-false}
-      MAIL_FROM: ${MAIL_FROM:-no-reply@nimba.local}
-      MAIL_FROM_NAME: ${MAIL_FROM_NAME:-Nimba}
-      RESEND_API_KEY: ${RESEND_API_KEY:-}
-      RESEND_BASE_URL: ${RESEND_BASE_URL:-https://api.resend.com}
-
-      # CORS — the public browser origin serving `web` (same host/port as
-      # APP_FRONTEND_BASE_URL in a single-host deployment).
-      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
-
-      # Object storage — inside the compose network the app talks to `minio` by
-      # name; the app authenticates with its OWN key pair, never the container
-      # root user (so production can point MINIO_ENDPOINT at a hosted S3 instead).
       MINIO_ENDPOINT: http://minio:9000
-      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
-      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
-      MINIO_BUCKET: ${MINIO_BUCKET}
+      AMORTIZATION_SCHEDULE_STORAGE_DIR: /app/storage/credit-cases
+      LOG_FILE: /app/logs/nimba.log
     volumes:
       # Persist uploaded CSV audit files and rotated logs across restarts/redeploys.
       - app-storage:/app/storage
