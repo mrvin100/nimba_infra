@@ -1,0 +1,205 @@
+# Full containerized stack for Nimba: web (Next.js) + app (Spring Boot) + postgres +
+# minio (+ mailpit for local/staging use). This is the "run everything in Docker,
+# like production" path.
+#
+# It is a DIFFERENT tool than app/docker-compose.yml: that file only starts the
+# infrastructure (postgres, minio, mailpit) so the backend can run natively with
+# `./gradlew bootRun` during day-to-day development. This file additionally builds
+# and runs the app and web containers themselves, so the whole platform can be
+# launched with one command the same way it would run on a server. Do not run both
+# compose files at the same time — they claim the same host ports by default.
+#
+# Usage (from this infra/ directory):
+#   cp .env.example .env      # then edit secrets/URLs for your environment
+#   docker compose build
+#   docker compose up -d
+#
+# See README.md for the full walkthrough.
+name: nimba-stack
+
+services:
+  postgres:
+    image: postgres:18 # latest stable PostgreSQL major (>= 16 required, NIMBA-5)
+    container_name: nimba-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    # PostgreSQL 18 images store data in a major-version subdirectory, so the volume
+    # is mounted at /var/lib/postgresql (NOT /var/lib/postgresql/data).
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - default
+
+  minio:
+    image: minio/minio:latest
+    container_name: nimba-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - default
+
+  # One-shot job: creates the app's bucket on first boot, then exits.
+  minio-init:
+    image: minio/mc:latest
+    container_name: nimba-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      mc mb --ignore-existing local/${MINIO_BUCKET};
+      mc anonymous set none local/${MINIO_BUCKET};
+      exit 0;"
+    networks:
+      - default
+
+  # Local SMTP catch-all so invitation e-mails can be inspected without a real relay.
+  # Only started with `--profile dev`; staging/production use MAIL_TRANSPORT=resend
+  # instead (see .env.example), so this container is not part of the default stack.
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: nimba-mailpit
+    restart: unless-stopped
+    profiles: ["dev"]
+    ports:
+      # SMTP port is the SAME MAIL_PORT the app dials, so the relay this container
+      # exposes and the relay the app connects to cannot drift.
+      - "${MAIL_PORT:-1025}:1025"
+      - "${MAILPIT_UI_PORT:-8025}:8025"
+    networks:
+      - default
+
+  app:
+    build:
+      context: ../app
+      dockerfile: Dockerfile
+    container_name: nimba-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      # Database — inside the compose network the app talks to the `postgres`
+      # service by name, on Postgres's own default port (not the host-mapped one).
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DATABASE_URL: ${DATABASE_URL:-}
+      DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-10}
+
+      # API
+      API_BASE_PATH: ${API_BASE_PATH:-/api/v1}
+
+      # CSV upload / audit storage
+      CSV_UPLOAD_MAX_FILE_SIZE: ${CSV_UPLOAD_MAX_FILE_SIZE:-2MB}
+      AMORTIZATION_SCHEDULE_STORAGE_DIR: /app/storage/credit-cases
+
+      # Auth / sessions
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      SESSION_TIMEOUT: ${SESSION_TIMEOUT:-PT8H}
+      AUTH_LOGIN_MAX_ATTEMPTS: ${AUTH_LOGIN_MAX_ATTEMPTS:-5}
+      AUTH_LOGIN_RATE_WINDOW: ${AUTH_LOGIN_RATE_WINDOW:-PT15M}
+
+      # Observability
+      ACTUATOR_EXPOSED_ENDPOINTS: ${ACTUATOR_EXPOSED_ENDPOINTS:-health,info}
+      LOG_FILE: /app/logs/nimba.log
+
+      # Account provisioning / invitation links — MUST be the public URL a human
+      # clicks from their inbox, i.e. where `web` is actually reachable, not the
+      # internal service name.
+      APP_FRONTEND_BASE_URL: ${APP_FRONTEND_BASE_URL:-http://localhost:3000}
+      INVITATION_TTL: ${INVITATION_TTL:-P7D}
+
+      # Mail
+      MAIL_ENABLED: ${MAIL_ENABLED:-true}
+      MAIL_TRANSPORT: ${MAIL_TRANSPORT:-smtp}
+      MAIL_HOST: ${MAIL_HOST:-mailpit}
+      MAIL_PORT: ${MAIL_PORT:-1025}
+      MAIL_USERNAME: ${MAIL_USERNAME:-}
+      MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+      MAIL_SMTP_AUTH: ${MAIL_SMTP_AUTH:-false}
+      MAIL_SMTP_STARTTLS: ${MAIL_SMTP_STARTTLS:-false}
+      MAIL_FROM: ${MAIL_FROM:-no-reply@nimba.local}
+      MAIL_FROM_NAME: ${MAIL_FROM_NAME:-Nimba}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      RESEND_BASE_URL: ${RESEND_BASE_URL:-https://api.resend.com}
+
+      # CORS — the public browser origin serving `web` (same host/port as
+      # APP_FRONTEND_BASE_URL in a single-host deployment).
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+
+      # Object storage — inside the compose network the app talks to `minio` by
+      # name; the app authenticates with its OWN key pair, never the container
+      # root user (so production can point MINIO_ENDPOINT at a hosted S3 instead).
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+    volumes:
+      # Persist uploaded CSV audit files and rotated logs across restarts/redeploys.
+      - app-storage:/app/storage
+      - app-logs:/app/logs
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    networks:
+      - default
+
+  web:
+    build:
+      context: ../web
+      dockerfile: Dockerfile
+      args:
+        # Baked into the client bundle at build time (see web/Dockerfile).
+        NEXT_PUBLIC_API_BASE_PATH: ${API_BASE_PATH:-/api/v1}
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
+    container_name: nimba-web
+    restart: unless-stopped
+    environment:
+      # Server-side only, read at runtime by next.config.ts's rewrites() — the
+      # browser never calls this directly, it calls `web` same-origin at /api/*.
+      BACKEND_ORIGIN: http://app:8080
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    networks:
+      - default
+
+volumes:
+  pgdata:
+  miniodata:
+  app-storage:
+  app-logs:
+
+networks:
+  default:
+    name: nimba-network
+    driver: bridge
