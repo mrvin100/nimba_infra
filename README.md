@@ -23,7 +23,7 @@ This mirrors the orchestration pattern used by the sibling ADAF project's
   - `postgres` (PostgreSQL 18) → localhost:5433
   - `minio` (S3-compatible object storage) → http://localhost:9000 (API), http://localhost:9001 (console)
   - `minio-init` — one-shot job that creates the app's bucket, then exits
-  - `mailpit` (SMTP catch-all, **`dev` profile only**) → http://localhost:8025
+  - `mailpit` (SMTP catch-all — part of the default stack) → http://localhost:8025
 
 Each Dockerfile lives next to the code it builds, not in this folder:
 
@@ -51,7 +51,7 @@ path. **Don't run both at once** — by default they claim the same host ports
 | Purpose | Local backend development | Full containerized stack ("production-like") |
 | Backend runs via | `./gradlew bootRun` (native, hot reload) | `app` container (built JAR) |
 | Frontend runs via | `pnpm dev` (native, hot reload) — not started by this file at all | `web` container (built app, `pnpm start`) |
-| Services started | postgres, minio, minio-init, mailpit | postgres, minio, minio-init, app, web (+ mailpit with `--profile dev`) |
+| Services started | postgres, minio, minio-init, mailpit | postgres, minio, minio-init, app, web, mailpit |
 
 ---
 
@@ -77,8 +77,12 @@ beyond a local trial run, also set:
   actually be reached at (these two must stay in sync — see the comments in
   `.env.example`)
 - `SESSION_COOKIE_SECURE=true` → once the stack is served over HTTPS
-- `MAIL_TRANSPORT=resend` + `RESEND_API_KEY` → most hosts block outbound SMTP,
-  so production mail should not depend on the local `mailpit` container
+- `MAIL_TRANSPORT=resend` + `RESEND_API_KEY` → once the bank wants real
+  delivery to external mailboxes instead of reading sent mail from Mailpit's
+  web UI (most hosts also block outbound SMTP, which `smtp`/Mailpit needs)
+- `MAILPIT_UI_AUTH` → set this (`user:pass`) before exposing `MAILPIT_UI_PORT`
+  on a real server; its UI shows every sent e-mail in clear text, including
+  password-reset and invitation links
 - `MINIO_ENDPOINT` in `docker-compose.yml`'s `app` service, plus
   `MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY` → if you're pointing at a hosted
   S3-compatible service instead of the bundled `minio` container
@@ -98,13 +102,12 @@ JAR ship) and `pnpm build` for `web`.
 ## 3. Launch the stack
 
 ```bash
-# Production-like: web, app, postgres, minio (no mailpit)
 docker compose up -d
-
-# Local full-stack testing: same, plus mailpit so invitation e-mails are
-# visible instead of requiring a real SMTP/Resend relay
-docker compose --profile dev up -d
 ```
+
+`web` waits for `app`'s healthcheck (`/actuator/health`) before starting, so
+there's no need to reload the bootstrap page a few times while the backend is
+still finishing its migrations on first boot.
 
 ## 4. Verify
 
@@ -117,7 +120,8 @@ docker compose logs -f app web
 - Backend health: http://localhost:8080/actuator/health
 - Backend Swagger UI: http://localhost:8080/swagger-ui/index.html
 - MinIO console: http://localhost:9001
-- Mailpit UI (with `--profile dev`): http://localhost:8025
+- Mailpit UI: http://localhost:8025 (put it behind `MAILPIT_UI_AUTH` before
+  exposing this on a real server)
 
 The very first time the stack comes up there are no user accounts yet — bootstrap
 the first admin from the frontend's `/bootstrap` page (or `POST
@@ -156,9 +160,11 @@ Database backup/restore scripts live in [`db/`](db/README.md).
 
 - `app` waits for `postgres` (healthy) and `minio` + `minio-init` (bucket created)
   before starting
-- `web` has no hard dependency on `app` starting first (matches the ADAF
-  `client`/`cms` pattern) — it comes up immediately; requests just fail until
-  `app` is ready, same as any reverse-proxied deployment
+- `web` waits for `app`'s own healthcheck (`GET /actuator/health`, polled every
+  5s once the container has had 30s to boot) before starting — without this, a
+  slower first boot (Flyway migrations + JVM warmup can take well past the
+  instant `docker compose up` returns) let the frontend query a backend that
+  wasn't listening yet
 
 ## Ports (host-mapped, override any of them in `.env`)
 
@@ -169,8 +175,8 @@ Database backup/restore scripts live in [`db/`](db/README.md).
 | `POSTGRES_PORT` | 5433 | postgres |
 | `MINIO_API_PORT` | 9000 | minio |
 | `MINIO_CONSOLE_PORT` | 9001 | minio |
-| `MAIL_PORT` | 1025 | mailpit (`dev` profile) |
-| `MAILPIT_UI_PORT` | 8025 | mailpit (`dev` profile) |
+| `MAIL_PORT` | 1025 | mailpit |
+| `MAILPIT_UI_PORT` | 8025 | mailpit |
 
 ---
 
@@ -179,12 +185,19 @@ Database backup/restore scripts live in [`db/`](db/README.md).
 - **`app` exits immediately / restarts in a loop** → `docker compose logs app`;
   almost always a database not yet reachable (check `postgres` is healthy) or a
   missing required secret.
-- **Frontend shows network errors calling the API** → check `docker compose
-  logs web`; `BACKEND_ORIGIN` (set automatically to `http://app:8080` inside
-  the compose network) is what `next.config.ts`'s proxy forwards `/api/*` to.
-- **Invitation e-mails never arrive** → in the default profile there is no mail
-  relay; either run with `--profile dev` (mailpit) or set `MAIL_TRANSPORT=resend`
-  with a valid `RESEND_API_KEY`.
+- **Frontend shows network errors calling the API, or the bootstrap page says
+  "an admin already exists" right after a fresh `docker compose up`** → check
+  `docker compose logs app`; the backend is most likely still starting
+  (migrations/JVM warmup) — `web` waits for its healthcheck before starting,
+  but a request made in the few seconds before that check first passes will
+  still fail. The bootstrap page now shows a clear "impossible de contacter le
+  serveur" message with a retry button in that case, rather than the
+  misleading "already initialized" one. `BACKEND_ORIGIN` (set automatically to
+  `http://app:8080` inside the compose network) is what `next.config.ts`'s
+  proxy forwards `/api/*` to.
+- **Invitation e-mails never arrive** → check `docker compose logs mailpit`
+  and confirm `MAIL_TRANSPORT=smtp`/`MAIL_HOST=mailpit`, or set
+  `MAIL_TRANSPORT=resend` with a valid `RESEND_API_KEY` for real delivery.
 - **MinIO bucket errors on first boot** → `minio-init` must complete before
   `app` starts; check `docker compose logs minio-init` — it should exit 0.
 - **Port already in use** → another instance of this stack, `app/docker-compose.yml`,

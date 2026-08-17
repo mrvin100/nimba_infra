@@ -77,14 +77,21 @@ services:
     networks:
       - default
 
-  # Local SMTP catch-all so invitation e-mails can be inspected without a real relay.
-  # Only started with `--profile dev`; staging/production use MAIL_TRANSPORT=resend
-  # instead (see .env.example), so this container is not part of the default stack.
+  # SMTP catch-all so invitation e-mails can be inspected without a real relay —
+  # part of the default stack (not gated behind a profile) so a deployed server
+  # running with MAIL_TRANSPORT=smtp (the .env.example default) works out of the
+  # box and the admin can read sent mail from its web UI. Switch
+  # MAIL_TRANSPORT=resend (and set RESEND_API_KEY) instead once real delivery to
+  # external mailboxes is needed; this container can keep running alongside it
+  # or be removed from the stack entirely. Set MAILPIT_UI_AUTH (see .env.example)
+  # to put the web UI behind a password before exposing this on a real server —
+  # it holds password-reset and invitation links in clear text.
   mailpit:
     image: axllent/mailpit:latest
     container_name: nimba-mailpit
     restart: unless-stopped
-    profiles: ["dev"]
+    environment:
+      MP_UI_AUTH: ${MAILPIT_UI_AUTH:-}
     ports:
       # SMTP port is the SAME MAIL_PORT the app dials, so the relay this container
       # exposes and the relay the app connects to cannot drift.
@@ -133,6 +140,18 @@ services:
       - app-logs:/app/logs
     ports:
       - "${APP_PORT:-8080}:8080"
+    # Actuator's own base path (/actuator) is fixed regardless of API_BASE_PATH —
+    # that prefix only applies to @RestControllers, not Spring Boot's
+    # auto-configured management endpoints. `web` waits on this below so a
+    # first-load bootstrap check can't race a still-starting backend (Flyway
+    # migrations + JVM warmup can take well over the default `docker compose up`
+    # return time on a slower machine) and misreport "an admin already exists".
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
     networks:
       - default
 
@@ -146,6 +165,9 @@ services:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
     container_name: nimba-web
     restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
     environment:
       # Server-side only, read at runtime by next.config.ts's rewrites() — the
       # browser never calls this directly, it calls `web` same-origin at /api/*.
