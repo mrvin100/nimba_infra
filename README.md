@@ -193,8 +193,9 @@ Database backup/restore scripts live in [`db/`](db/README.md).
   still fail. The bootstrap page now shows a clear "impossible de contacter le
   serveur" message with a retry button in that case, rather than the
   misleading "already initialized" one. `BACKEND_ORIGIN` (set automatically to
-  `http://app:8080` inside the compose network) is what `next.config.ts`'s
-  proxy forwards `/api/*` to.
+  `http://app:8080` inside the compose network) is what `proxy.ts`'s middleware
+  forwards `/api/*` to, read fresh on every request (not baked in at image build
+  time, unlike `next.config.ts`'s `rewrites()`).
 - **Invitation e-mails never arrive** → check `docker compose logs mailpit`
   and confirm `MAIL_TRANSPORT=smtp`/`MAIL_HOST=mailpit`, or set
   `MAIL_TRANSPORT=resend` with a valid `RESEND_API_KEY` for real delivery.
