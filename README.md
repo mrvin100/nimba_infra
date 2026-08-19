@@ -196,6 +196,24 @@ Database backup/restore scripts live in [`db/`](db/README.md).
   `http://app:8080` inside the compose network) is what `proxy.ts`'s middleware
   forwards `/api/*` to, read fresh on every request (not baked in at image build
   time, unlike `next.config.ts`'s `rewrites()`).
+- **Reads work but every write fails: the bootstrap page loads and reports no
+  admin yet, then "créer" fails, and logging in fails too** → the browser is
+  reaching `web` at a different origin than `app` believes, and `app` rejects the
+  write as cross-origin (its response body is literally `Invalid CORS request`).
+  Only writes break, because browsers attach an `Origin` header to `POST`/`PUT`/
+  `DELETE` but not to a plain `GET` — which is also why the same call succeeds
+  from Swagger UI, served same-origin with the backend. `web`'s proxy sends
+  `X-Forwarded-Host`/`-Proto`/`-Port` and `app` honors them
+  (`FORWARD_HEADERS_STRATEGY`, default `framework`), so this resolves itself at
+  any hostname or port; if you have overridden that variable to `none`, or put
+  another proxy in front that strips those headers, restore them rather than
+  widening `CORS_ALLOWED_ORIGINS`.
+- **Same symptom, but only once you put nginx/Traefik in front for HTTPS** → that
+  proxy must pass the browser's original host through, because Next.js rebuilds
+  `X-Forwarded-Host` from `Host` and discards any value the front proxy set. With
+  nginx that means `proxy_set_header Host $host;` (not `$proxy_host`) alongside
+  `proxy_set_header X-Forwarded-Proto $scheme;`. Send `Host: web:3000` instead and
+  the backend believes the site lives at `web:3000`, so every write 403s again.
 - **Invitation e-mails never arrive** → check `docker compose logs mailpit`
   and confirm `MAIL_TRANSPORT=smtp`/`MAIL_HOST=mailpit`, or set
   `MAIL_TRANSPORT=resend` with a valid `RESEND_API_KEY` for real delivery.

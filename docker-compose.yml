@@ -169,8 +169,10 @@ services:
       app:
         condition: service_healthy
     environment:
-      # Server-side only, read at runtime by next.config.ts's rewrites() — the
-      # browser never calls this directly, it calls `web` same-origin at /api/*.
+      # Server-side only, read at runtime by proxy.ts on every request — the
+      # browser never calls this directly, it calls `web` same-origin at /api/*
+      # and this hop forwards it (adding X-Forwarded-* so `app` can still tell
+      # which origin the browser really used).
       BACKEND_ORIGIN: http://app:8080
     ports:
       - "${WEB_PORT:-3000}:3000"
